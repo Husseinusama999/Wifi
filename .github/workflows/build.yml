@@ -99,7 +99,11 @@ jobs:
           import android.view.Gravity
           import android.view.ViewGroup.LayoutParams.MATCH_PARENT
           import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.net.http.SslError
           import android.webkit.HttpAuthHandler
+          import android.webkit.SslErrorHandler
+          import android.webkit.WebResourceError
+          import android.webkit.WebResourceRequest
           import android.webkit.WebView
           import android.webkit.WebViewClient
           import android.widget.*
@@ -115,6 +119,7 @@ jobs:
               private var current: Router? = null
               private var filled = false
               private var authTried = false
+              private var httpFallback = false
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -185,9 +190,9 @@ jobs:
               }
 
               private fun load(r: Router) {
-                  current = r; filled = false; authTried = false
+                  current = r; filled = false; authTried = false; httpFallback = false
                   title.text = r.name
-                  web.loadUrl("http://$gateway")
+                  web.loadUrl("https://$gateway")
               }
 
               private fun askCredentials(existing: Router?) {
@@ -212,12 +217,26 @@ jobs:
                               user.text.toString(), pass.text.toString())
                           store.save(r); load(r)
                       }
-                      .setNegativeButton("فتح بدون حفظ") { _, _ -> current = null; web.loadUrl("http://$gw") }
+                      .setNegativeButton("فتح بدون حفظ") { _, _ -> current = null; web.loadUrl("https://$gw") }
                       .show()
               }
 
               // ---- auto login ----
               private val client = object : WebViewClient() {
+                  // Router uses a self-signed certificate: accept it, but only for the router itself
+                  override fun onReceivedSslError(v: WebView, h: SslErrorHandler, e: SslError) {
+                      val host = android.net.Uri.parse(e.url).host
+                      if (host == gateway) h.proceed() else h.cancel()
+                  }
+
+                  // If the router has no https, fall back to http
+                  override fun onReceivedError(v: WebView, req: WebResourceRequest, err: WebResourceError) {
+                      if (req.isForMainFrame && req.url.scheme == "https" && !httpFallback) {
+                          httpFallback = true
+                          v.loadUrl("http://$gateway")
+                      }
+                  }
+
                   // Popup-style login (HTTP Basic/Digest)
                   override fun onReceivedHttpAuthRequest(v: WebView, h: HttpAuthHandler, host: String?, realm: String?) {
                       val r = current
@@ -240,7 +259,9 @@ jobs:
                           function set(el,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v);
                             el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}
                           if(us)set(us,u);set(pw,p);
-                          var f=pw.form;var b=(f||document).querySelector('button[type=submit],input[type=submit],button');
+                          var f=pw.form;var b=(f||document).querySelector('button[type=submit],input[type=submit]');
+                          if(!b){b=Array.from(document.querySelectorAll('button,input[type=button],a,div,span')).filter(function(x){return /^\s*(login|log in|sign in)\s*$/i.test(x.innerText||x.value||'')}).pop();}
+                          if(!b){b=document.querySelector('button');}
                           setTimeout(function(){if(b)b.click();else if(f)f.submit();},300);
                         } else if(++n>20)clearInterval(t);},500);})(${JSONObject.quote(r.user)},${JSONObject.quote(r.pass)});
                       """.trimIndent()
