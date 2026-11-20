@@ -1,0 +1,290 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Generate project and build
+        run: |
+          set -e
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'EOF_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "RouterLogin"
+          include(":app")
+          EOF_0
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'EOF_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_1
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'EOF_2'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF_2
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'EOF_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.routerlogin"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.routerlogin"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation("androidx.security:security-crypto:1.1.0-alpha06")
+          }
+          EOF_3
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'EOF_4'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+              <application
+                  android:label="Router Login"
+                  android:usesCleartextTraffic="true"
+                  android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_4
+          mkdir -p "$(dirname 'app/src/main/java/com/example/routerlogin/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/routerlogin/MainActivity.kt' <<'EOF_5'
+          package com.example.routerlogin
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.pm.PackageManager
+          import android.net.ConnectivityManager
+          import android.net.NetworkCapabilities
+          import android.net.wifi.WifiManager
+          import android.os.Bundle
+          import android.text.InputType
+          import android.view.Gravity
+          import android.view.ViewGroup.LayoutParams.MATCH_PARENT
+          import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
+          import android.webkit.HttpAuthHandler
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import android.widget.*
+          import org.json.JSONObject
+          import java.net.Inet4Address
+
+          class MainActivity : Activity() {
+              private lateinit var store: RouterStore
+              private lateinit var web: WebView
+              private lateinit var title: TextView
+              private var gateway: String? = null
+              private var key: String? = null
+              private var current: Router? = null
+              private var filled = false
+              private var authTried = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  store = RouterStore(this)
+
+                  title = TextView(this).apply { textSize = 16f; setPadding(24, 24, 24, 24) }
+                  val edit = Button(this).apply { text = "تعديل"; setOnClickListener { askCredentials(current) } }
+                  val del = Button(this).apply {
+                      text = "حذف"
+                      setOnClickListener {
+                          key?.let { store.delete(it) }
+                          current = null
+                          web.loadUrl("about:blank")
+                          start()
+                      }
+                  }
+                  val bar = LinearLayout(this).apply {
+                      gravity = Gravity.CENTER_VERTICAL
+                      addView(title, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+                      addView(edit); addView(del)
+                  }
+                  web = WebView(this).apply {
+                      settings.javaScriptEnabled = true
+                      settings.domStorageEnabled = true
+                      webViewClient = client
+                  }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      addView(bar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT))
+                      addView(web, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
+                  })
+
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED)
+                      requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION), 1)
+                  else start()
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) = start()
+
+              // ---- network detection ----
+              private fun findGateway(): String? {
+                  val cm = getSystemService(ConnectivityManager::class.java)
+                  val net = cm.activeNetwork ?: return null
+                  val caps = cm.getNetworkCapabilities(net) ?: return null
+                  if (!caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) return null
+                  val lp = cm.getLinkProperties(net) ?: return null
+                  return lp.routes.firstOrNull { it.isDefaultRoute && it.gateway is Inet4Address }?.gateway?.hostAddress
+              }
+
+              @Suppress("DEPRECATION")
+              private fun ssid(): String? {
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) return null
+                  val s = applicationContext.getSystemService(WifiManager::class.java).connectionInfo?.ssid?.trim('"')
+                  return if (s.isNullOrBlank() || s == "<unknown ssid>") null else s
+              }
+
+              // ---- main flow ----
+              private fun start() {
+                  gateway = findGateway()
+                  val gw = gateway
+                  if (gw == null) { title.text = "مش متصل بواي فاي"; return }
+                  key = "${ssid() ?: "?"}|$gw"
+                  val saved = store.get(key!!)
+                  if (saved != null) load(saved) else {
+                      title.text = "راوتر جديد ($gw)"
+                      askCredentials(null)
+                  }
+              }
+
+              private fun load(r: Router) {
+                  current = r; filled = false; authTried = false
+                  title.text = r.name
+                  web.loadUrl("http://$gateway")
+              }
+
+              private fun askCredentials(existing: Router?) {
+                  val gw = gateway ?: return
+                  val name = EditText(this).apply { hint = "اسم الراوتر (مثلا: راوتر البيت)"; setText(existing?.name ?: "") }
+                  val user = EditText(this).apply { hint = "اليوزر نيم"; setText(existing?.user ?: "admin") }
+                  val pass = EditText(this).apply {
+                      hint = "الباسورد"
+                      inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                      setText(existing?.pass ?: "")
+                  }
+                  val box = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 24, 48, 0)
+                      addView(name); addView(user); addView(pass)
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("بيانات الراوتر $gw")
+                      .setView(box)
+                      .setPositiveButton("حفظ") { _, _ ->
+                          val r = Router(key ?: return@setPositiveButton, name.text.toString().ifBlank { gw },
+                              user.text.toString(), pass.text.toString())
+                          store.save(r); load(r)
+                      }
+                      .setNegativeButton("فتح بدون حفظ") { _, _ -> current = null; web.loadUrl("http://$gw") }
+                      .show()
+              }
+
+              // ---- auto login ----
+              private val client = object : WebViewClient() {
+                  // Popup-style login (HTTP Basic/Digest)
+                  override fun onReceivedHttpAuthRequest(v: WebView, h: HttpAuthHandler, host: String?, realm: String?) {
+                      val r = current
+                      if (r != null && !authTried) { authTried = true; h.proceed(r.user, r.pass) }
+                      else { h.cancel(); Toast.makeText(this@MainActivity, "اليوزر أو الباسورد غلط؟ دوس تعديل", Toast.LENGTH_LONG).show() }
+                  }
+
+                  // Form-style login
+                  override fun onPageFinished(v: WebView, url: String?) {
+                      val r = current ?: return
+                      if (filled) return
+                      filled = true
+                      val js = """
+                      (function(u,p){var n=0;var t=setInterval(function(){
+                        var pw=document.querySelector('input[type=password]');
+                        if(pw&&pw.offsetParent!==null){clearInterval(t);
+                          var ins=Array.from(document.querySelectorAll('input')).filter(function(i){
+                            return i.offsetParent!==null&&(i.type=='text'||i.type=='email'||!i.type)});
+                          var us=ins.filter(function(i){return i.compareDocumentPosition(pw)&4}).pop();
+                          function set(el,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(el,v);
+                            el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));}
+                          if(us)set(us,u);set(pw,p);
+                          var f=pw.form;var b=(f||document).querySelector('button[type=submit],input[type=submit],button');
+                          setTimeout(function(){if(b)b.click();else if(f)f.submit();},300);
+                        } else if(++n>20)clearInterval(t);},500);})(${JSONObject.quote(r.user)},${JSONObject.quote(r.pass)});
+                      """.trimIndent()
+                      v.evaluateJavascript(js, null)
+                  }
+              }
+          }
+          EOF_5
+          mkdir -p "$(dirname 'app/src/main/java/com/example/routerlogin/RouterStore.kt')"
+          cat > 'app/src/main/java/com/example/routerlogin/RouterStore.kt' <<'EOF_6'
+          package com.example.routerlogin
+
+          import android.content.Context
+          import androidx.security.crypto.EncryptedSharedPreferences
+          import androidx.security.crypto.MasterKey
+          import org.json.JSONObject
+
+          data class Router(val key: String, val name: String, val user: String, val pass: String)
+
+          class RouterStore(ctx: Context) {
+              private val prefs = EncryptedSharedPreferences.create(
+                  ctx, "routers",
+                  MasterKey.Builder(ctx).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+                  EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+                  EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+              )
+
+              fun get(key: String): Router? {
+                  val s = prefs.getString(key, null) ?: return null
+                  val o = JSONObject(s)
+                  return Router(key, o.getString("name"), o.getString("user"), o.getString("pass"))
+              }
+
+              fun save(r: Router) {
+                  val o = JSONObject().put("name", r.name).put("user", r.user).put("pass", r.pass)
+                  prefs.edit().putString(r.key, o.toString()).apply()
+              }
+
+              fun delete(key: String) = prefs.edit().remove(key).apply()
+          }
+          EOF_6
+          gradle assembleDebug --no-daemon
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: router-login-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
